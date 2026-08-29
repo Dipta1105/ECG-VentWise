@@ -1,3 +1,4 @@
+```cpp
 #include <Arduino.h>
 #include <Wire.h>
 #include <DHT.h>
@@ -7,6 +8,18 @@
 #include <HardwareSerial.h>
 #include <WiFi.h>
 #include <esp_now.h>
+
+// =====================================================
+// HYDROS ENVIRONMENT SENSOR NODE
+// BOARD: ESP32 DOIT DEVKIT V1
+// =====================================================
+//
+// ENV MAC:
+// 00:70:07:E2:22:E0
+//
+// MASTER MAC:
+// 8C:94:DF:6D:86:F4
+// =====================================================
 
 // =====================================================
 // PIN CONFIGURATION
@@ -28,13 +41,11 @@
 #define SERIAL_BAUD   115200
 
 // =====================================================
-// ESP-NOW MASTER MAC
-// ESP32 DOIT DEVKIT V1 MASTER/OBC
-// MAC: 00:70:07:E2:22:E0
+// MASTER PEER MAC
 // =====================================================
 
 uint8_t MASTER_MAC[] = {
-  0x00, 0x70, 0x07, 0xE2, 0x22, 0xE0
+  0x8C, 0x94, 0xDF, 0x6D, 0x86, 0xF4
 };
 
 // =====================================================
@@ -54,22 +65,22 @@ HardwareSerial GPS(2);
 // =====================================================
 
 float temperature = 0;
-float humidity    = 0;
+float humidity = 0;
 
-float pressure    = 0;
-float altitude    = 0;
+float pressure = 0;
+float altitude = 0;
 
 float accX = 0;
 float accY = 0;
 float accZ = 0;
 
-double latitude  = 0;
+double latitude = 0;
 double longitude = 0;
 
 uint32_t satellites = 0;
 
 // =====================================================
-// SENSOR STATUS
+// STATUS
 // =====================================================
 
 bool dhtOK = false;
@@ -88,10 +99,10 @@ unsigned long lastSend = 0;
 unsigned long lastLED = 0;
 
 const unsigned long SENSOR_INTERVAL = 2000;
-const unsigned long SEND_INTERVAL   = 2000;
+const unsigned long SEND_INTERVAL = 2000;
 
 // =====================================================
-// ESP-NOW RECEIVE BUFFER
+// RECEIVE BUFFER
 // =====================================================
 
 volatile bool commandReady = false;
@@ -99,21 +110,18 @@ volatile bool commandReady = false;
 char commandBuffer[64];
 
 // =====================================================
-// ESP-NOW SEND CALLBACK
-// ESP32 CORE 3.x
+// SEND CALLBACK
 // =====================================================
 
 void onDataSent(
   const wifi_tx_info_t *info,
   esp_now_send_status_t status
 ) {
-  // Keep callback EMPTY.
-  // Do not use Serial/String/I2C here.
+  // Keep callback lightweight.
 }
 
 // =====================================================
-// ESP-NOW RECEIVE CALLBACK
-// ESP32 CORE 3.x
+// RECEIVE CALLBACK
 // =====================================================
 
 void onDataRecv(
@@ -121,29 +129,28 @@ void onDataRecv(
   const uint8_t *data,
   int len
 ) {
-  if (data == nullptr || len <= 0) {
-    return;
-  }
 
-  if (len >= sizeof(commandBuffer)) {
+  if (data == nullptr || len <= 0)
+    return;
+
+  if (len >= sizeof(commandBuffer))
     len = sizeof(commandBuffer) - 1;
-  }
 
   memcpy(commandBuffer, data, len);
+
   commandBuffer[len] = '\0';
 
   commandReady = true;
 }
 
 // =====================================================
-// SEND ESP-NOW MESSAGE
+// SEND MESSAGE
 // =====================================================
 
 void sendMessage(const char *msg) {
 
-  if (!espNowOK || msg == nullptr) {
+  if (!espNowOK || msg == nullptr)
     return;
-  }
 
   esp_now_send(
     MASTER_MAC,
@@ -180,16 +187,16 @@ void scanI2C() {
     }
   }
 
-  if (count == 0) {
+  if (count == 0)
     Serial.println("No I2C devices found");
-  } else {
+  else {
     Serial.print("I2C devices: ");
     Serial.println(count);
   }
 }
 
 // =====================================================
-// INITIALIZE I2C SENSORS
+// SENSOR INITIALIZATION
 // =====================================================
 
 void initSensors() {
@@ -197,16 +204,14 @@ void initSensors() {
   Serial.println();
   Serial.println("=== SENSOR INITIALIZATION ===");
 
-  // ---------------- DHT22 ----------------
-
+  // DHT22
   dht.begin();
 
   delay(500);
 
   Serial.println("DHT22 initialized");
 
-  // ---------------- BMP280 ----------------
-
+  // BMP280
   if (bmp.begin(0x76)) {
 
     bmpOK = true;
@@ -226,8 +231,7 @@ void initSensors() {
     Serial.println("BMP280 NOT FOUND");
   }
 
-  // ---------------- LIS3DH ----------------
-
+  // LIS3DH
   if (lis.begin(0x19)) {
 
     lisOK = true;
@@ -255,7 +259,7 @@ void initSensors() {
 }
 
 // =====================================================
-// READ DHT22
+// READ DHT
 // =====================================================
 
 void readDHT() {
@@ -290,6 +294,7 @@ void readBMP() {
   if (isnan(p) || p <= 0) {
 
     bmpOK = false;
+
     return;
   }
 
@@ -315,7 +320,7 @@ void readLIS() {
 }
 
 // =====================================================
-// PROCESS GPS
+// GPS
 // =====================================================
 
 void processGPS() {
@@ -348,12 +353,11 @@ void readSensors() {
   readDHT();
   readBMP();
   readLIS();
-
   processGPS();
 }
 
 // =====================================================
-// PRINT SENSOR DATA
+// PRINT DATA
 // =====================================================
 
 void printData() {
@@ -430,9 +434,6 @@ void printData() {
 
 // =====================================================
 // SEND TELEMETRY
-//
-// Format:
-// DATA,T,H,P,A,X,Y,Z,LAT,LON,SAT,DHT,BMP,LIS,GPS
 // =====================================================
 
 void sendTelemetry() {
@@ -507,6 +508,15 @@ void printStatus() {
   Serial.println();
   Serial.println("========== ENV STATUS ==========");
 
+  Serial.print("BOARD      : ");
+  Serial.println("ESP32 DOIT DEVKIT V1");
+
+  Serial.print("ACTUAL MAC : ");
+  Serial.println(WiFi.macAddress());
+
+  Serial.print("MASTER MAC : ");
+  Serial.println("8C:94:DF:6D:86:F4");
+
   Serial.print("DHT22      : ");
   Serial.println(dhtOK ? "OK" : "FAIL");
 
@@ -525,12 +535,6 @@ void printStatus() {
   Serial.print("ESP-NOW    : ");
   Serial.println(espNowOK ? "OK" : "FAIL");
 
-  Serial.print("ENV MAC    : ");
-  Serial.println(WiFi.macAddress());
-
-  Serial.print("MASTER MAC : ");
-  Serial.println("00:70:07:E2:22:E0");
-
   Serial.println("===============================");
 }
 
@@ -543,73 +547,53 @@ void processCommand(char *cmd) {
   if (cmd == nullptr)
     return;
 
-  // Remove CR/LF and convert lowercase to uppercase
   for (int i = 0; cmd[i]; i++) {
 
-    if (cmd[i] == '\r' || cmd[i] == '\n') {
+    if (cmd[i] == '\r' || cmd[i] == '\n')
       cmd[i] = '\0';
-    }
 
-    if (cmd[i] >= 'a' && cmd[i] <= 'z') {
+    if (cmd[i] >= 'a' && cmd[i] <= 'z')
       cmd[i] -= 32;
-    }
   }
 
   Serial.print("[COMMAND] ");
   Serial.println(cmd);
 
-  // ---------------- PING ----------------
-
   if (strcmp(cmd, "PING") == 0) {
 
     Serial.println("PONG");
-
     sendMessage("PONG");
-  }
 
-  // ---------------- STATUS ----------------
+  } else if (strcmp(cmd, "MASTER:READY") == 0) {
 
-  else if (strcmp(cmd, "STATUS") == 0) {
+    Serial.println("[MASTER] MASTER IS READY");
+    sendMessage("SLAVE:READY");
+
+  } else if (strcmp(cmd, "STATUS") == 0) {
 
     printStatus();
-
     sendStatus();
-  }
 
-  // ---------------- DATA ----------------
-
-  else if (strcmp(cmd, "DATA") == 0) {
+  } else if (strcmp(cmd, "DATA") == 0) {
 
     readSensors();
-
     printData();
-
     sendTelemetry();
-  }
 
-  // ---------------- SCAN ----------------
-
-  else if (strcmp(cmd, "SCAN") == 0) {
+  } else if (strcmp(cmd, "SCAN") == 0) {
 
     scanI2C();
-  }
 
-  // ---------------- HELP ----------------
-
-  else if (strcmp(cmd, "HELP") == 0) {
+  } else if (strcmp(cmd, "HELP") == 0) {
 
     Serial.println();
-    Serial.println("Commands:");
     Serial.println("PING");
     Serial.println("STATUS");
     Serial.println("DATA");
     Serial.println("SCAN");
     Serial.println("HELP");
-  }
 
-  // ---------------- UNKNOWN ----------------
-
-  else {
+  } else {
 
     Serial.println("Unknown command");
   }
@@ -659,8 +643,7 @@ bool initESPNow() {
   Serial.print("ENV MAC: ");
   Serial.println(WiFi.macAddress());
 
-  Serial.print("MASTER MAC: ");
-  Serial.println("00:70:07:E2:22:E0");
+  Serial.println("MASTER PEER MAC: 8C:94:DF:6D:86:F4");
 
   if (esp_now_init() != ESP_OK) {
 
@@ -693,6 +676,7 @@ bool initESPNow() {
     }
   }
 
+  Serial.println("MASTER PEER ADDED");
   Serial.println("ESP-NOW READY");
 
   return true;
@@ -703,8 +687,6 @@ bool initESPNow() {
 // =====================================================
 
 void updateLEDs() {
-
-  // LED 1 = sensor status
 
   if (dhtOK && bmpOK && lisOK) {
 
@@ -720,8 +702,6 @@ void updateLEDs() {
       millis() % 1000 < 500
     );
   }
-
-  // LED 2 = heartbeat
 
   if (millis() - lastLED >= 500) {
 
@@ -752,15 +732,15 @@ void setup() {
   Serial.println("   DOIT ESP32 DEVKIT V1");
   Serial.println("================================");
 
-  // ---------------- LEDs ----------------
-
   pinMode(INDICATOR1, OUTPUT);
   pinMode(INDICATOR2, OUTPUT);
 
   digitalWrite(INDICATOR1, LOW);
   digitalWrite(INDICATOR2, LOW);
 
-  // ---------------- I2C ----------------
+  // ===================================================
+  // I2C
+  // ===================================================
 
   Serial.println("Starting I2C...");
 
@@ -781,11 +761,15 @@ void setup() {
 
   scanI2C();
 
-  // ---------------- Sensors ----------------
+  // ===================================================
+  // SENSORS
+  // ===================================================
 
   initSensors();
 
-  // ---------------- GPS ----------------
+  // ===================================================
+  // GNSS
+  // ===================================================
 
   Serial.println("Starting GNSS...");
 
@@ -796,11 +780,15 @@ void setup() {
     GPS_TX
   );
 
-  // ---------------- ESP-NOW ----------------
+  // ===================================================
+  // ESP-NOW
+  // ===================================================
 
   espNowOK = initESPNow();
 
-  // ---------------- Done ----------------
+  // ===================================================
+  // COMPLETE
+  // ===================================================
 
   Serial.println();
   Serial.println("================================");
@@ -811,9 +799,11 @@ void setup() {
 
   if (espNowOK) {
 
+    delay(100);
+
     sendMessage("SLAVE:BOOT_COMPLETE");
 
-    delay(50);
+    delay(100);
 
     sendMessage("SLAVE:READY");
   }
@@ -825,13 +815,10 @@ void setup() {
 
 void loop() {
 
-  // Always process GPS
   processGPS();
 
-  // Process ESP-NOW commands
   processReceivedCommand();
 
-  // USB serial commands
   if (Serial.available()) {
 
     static char serialBuffer[64];
@@ -859,8 +846,6 @@ void loop() {
     }
   }
 
-  // Sensor reading
-
   unsigned long now = millis();
 
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
@@ -872,8 +857,6 @@ void loop() {
     printData();
   }
 
-  // ESP-NOW telemetry
-
   if (now - lastSend >= SEND_INTERVAL) {
 
     lastSend = now;
@@ -881,9 +864,8 @@ void loop() {
     sendTelemetry();
   }
 
-  // LEDs
-
   updateLEDs();
 
   delay(5);
 }
+```
