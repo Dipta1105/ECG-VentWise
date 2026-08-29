@@ -29,11 +29,12 @@
 
 // =====================================================
 // ESP-NOW MASTER MAC
-// CHANGE THIS TO THE REAL ESP8266 MAC
+// ESP32 DOIT DEVKIT V1 MASTER/OBC
+// MAC: 00:70:07:E2:22:E0
 // =====================================================
 
 uint8_t MASTER_MAC[] = {
-  0x50, 0x02, 0x91, 0x51, 0xEB, 0x88
+  0x00, 0x70, 0x07, 0xE2, 0x22, 0xE0
 };
 
 // =====================================================
@@ -431,7 +432,6 @@ void printData() {
 // SEND TELEMETRY
 //
 // Format:
-//
 // DATA,T,H,P,A,X,Y,Z,LAT,LON,SAT,DHT,BMP,LIS,GPS
 // =====================================================
 
@@ -528,6 +528,9 @@ void printStatus() {
   Serial.print("ENV MAC    : ");
   Serial.println(WiFi.macAddress());
 
+  Serial.print("MASTER MAC : ");
+  Serial.println("00:70:07:E2:22:E0");
+
   Serial.println("===============================");
 }
 
@@ -540,7 +543,7 @@ void processCommand(char *cmd) {
   if (cmd == nullptr)
     return;
 
-  // Remove CR/LF
+  // Remove CR/LF and convert lowercase to uppercase
   for (int i = 0; cmd[i]; i++) {
 
     if (cmd[i] == '\r' || cmd[i] == '\n') {
@@ -560,6 +563,7 @@ void processCommand(char *cmd) {
   if (strcmp(cmd, "PING") == 0) {
 
     Serial.println("PONG");
+
     sendMessage("PONG");
   }
 
@@ -568,6 +572,7 @@ void processCommand(char *cmd) {
   else if (strcmp(cmd, "STATUS") == 0) {
 
     printStatus();
+
     sendStatus();
   }
 
@@ -576,7 +581,9 @@ void processCommand(char *cmd) {
   else if (strcmp(cmd, "DATA") == 0) {
 
     readSensors();
+
     printData();
+
     sendTelemetry();
   }
 
@@ -651,6 +658,9 @@ bool initESPNow() {
 
   Serial.print("ENV MAC: ");
   Serial.println(WiFi.macAddress());
+
+  Serial.print("MASTER MAC: ");
+  Serial.println("00:70:07:E2:22:E0");
 
   if (esp_now_init() != ESP_OK) {
 
@@ -736,6 +746,7 @@ void setup() {
 
   Serial.println();
   Serial.println();
+
   Serial.println("================================");
   Serial.println("   HYDROS ENV ESP32");
   Serial.println("   DOIT ESP32 DEVKIT V1");
@@ -817,7 +828,7 @@ void loop() {
   // Always process GPS
   processGPS();
 
-  // Process commands
+  // Process ESP-NOW commands
   processReceivedCommand();
 
   // USB serial commands
