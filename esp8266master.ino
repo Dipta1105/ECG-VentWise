@@ -6,11 +6,11 @@ extern "C" {
 }
 
 // =====================================================
-// ESP32 ENV MAC ADDRESS
-// CHANGE THIS AFTER GETTING THE ESP32 MAC
+// ESP32 DOIT DEVKIT V1 MASTER MAC ADDRESS
+// MASTER / OBC
 // =====================================================
 uint8_t esp32MAC[] = {
-  0x8C, 0x94, 0xDF, 0x6D, 0x86, 0xF4
+  0x00, 0x70, 0x07, 0xE2, 0x22, 0xE0
 };
 
 // =====================================================
@@ -29,9 +29,14 @@ void onDataReceive(uint8_t *mac, uint8_t *data, uint8_t len) {
   Serial.print("From MAC: ");
 
   for (int i = 0; i < 6; i++) {
-    if (mac[i] < 16) Serial.print("0");
+
+    if (mac[i] < 16)
+      Serial.print("0");
+
     Serial.print(mac[i], HEX);
-    if (i < 5) Serial.print(":");
+
+    if (i < 5)
+      Serial.print(":");
   }
 
   Serial.println();
@@ -50,27 +55,46 @@ void setup() {
   Serial.println(" HYDROS ESP8266 RECEIVER");
   Serial.println("==============================");
 
+  // ===================================================
   // WiFi Station
+  // ===================================================
+
   WiFi.mode(WIFI_STA);
 
   Serial.print("ESP8266 MAC: ");
   Serial.println(WiFi.macAddress());
 
-  // ESP-NOW initialization
+  // ===================================================
+  // ESP-NOW INITIALIZATION
+  // ===================================================
+
   if (esp_now_init() != 0) {
+
     Serial.println("ESP-NOW INIT FAILED");
+
     return;
   }
 
   Serial.println("ESP-NOW INIT OK");
 
-  // Set receiver role
+  // ===================================================
+  // SET RECEIVER ROLE
+  // ===================================================
+
   esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
 
-  // Register receive callback
+  // ===================================================
+  // REGISTER RECEIVE CALLBACK
+  // ===================================================
+
   esp_now_register_recv_cb(onDataReceive);
 
-  // Add ESP32 ENV as peer
+  // ===================================================
+  // ADD ESP32 DOIT DEVKIT V1 MASTER/OBC AS PEER
+  // MAC:
+  // 00:70:07:E2:22:E0
+  // ===================================================
+
   int result = esp_now_add_peer(
     esp32MAC,
     ESP_NOW_ROLE_COMBO,
@@ -80,9 +104,12 @@ void setup() {
   );
 
   if (result == 0) {
-    Serial.println("ESP32 ENV PEER ADDED");
+
+    Serial.println("ESP32 DOIT MASTER PEER ADDED");
+
   } else {
-    Serial.print("FAILED TO ADD ESP32 PEER: ");
+
+    Serial.print("FAILED TO ADD ESP32 MASTER PEER: ");
     Serial.println(result);
   }
 
@@ -94,6 +121,7 @@ void setup() {
 // =====================================================
 // LOOP
 // =====================================================
+
 void loop() {
 
   delay(10);
