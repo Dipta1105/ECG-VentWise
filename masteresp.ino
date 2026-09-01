@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <WebSocketsServer.h>
 
 // =====================================================
 // VENTWISE V3 - MASTER / OBC (CONSOLIDATED FIRMWARE)
@@ -161,19 +162,92 @@ bool screenNeedsRedraw = true;
 // =====================================================
 // The wristband unit (wristband.ino) transmits this exact
 // packed struct over ESP-NOW. Layout must match byte-for-byte.
+// Must match wristband.ino byte for byte. Bump WRIST_PACKET_VERSION
+// on both sides together whenever this changes -- the version byte
+// is what turns a half-flashed pair into a clear log line instead
+// of silently misread vitals.
+#define WRIST_PACKET_MAGIC   0x5742   // 'WB'
+#define WRIST_PACKET_VERSION 2
+
+#define HEALTH_PULSEOX 0x01
+#define HEALTH_ACCEL   0x02
+#define HEALTH_TEMP    0x04
+
 typedef struct __attribute__((packed)) {
+  uint16_t magic;
+  uint8_t  version;
+  uint8_t  sensorHealth;
+  uint16_t seq;
+
   int16_t heartRate;
   int16_t spo2;
   uint8_t fingerDetected;
   uint8_t fallDetected;
-  int16_t accel;
   uint8_t panicPressed;
+
+  int16_t accel;       // magnitude, m/s^2 x10
+  int16_t ax;          // per-axis, m/s^2 x100
+  int16_t ay;
+  int16_t az;
+  int16_t accelPeak;   // max magnitude since previous packet, m/s^2 x10
+
   float temperatureF;
 } WristbandPacket;
 
-WristbandPacket latestWristband = { 0, 0, 0, 0, 0, 0, -127.0 };
+WristbandPacket latestWristband = {
+  WRIST_PACKET_MAGIC, WRIST_PACKET_VERSION, 0, 0,
+  0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0,
+  -127.0
+};
+
 unsigned long lastWristbandRxTime = 0;
 bool wristbandLinkEverSeen = false;
+
+// The band transmits at 20 Hz. Printing every packet would put the
+// master in Serial.print for a large part of every second, so the
+// log is throttled and the packet counter carries the rate.
+unsigned long wristbandRxCount     = 0;
+unsigned long lastWristbandLogTime = 0;
+const unsigned long WRISTBAND_LOG_INTERVAL = 1000;
+
+// =====================================================
+// ENVIRONMENTAL READINGS - RETAINED
+// =====================================================
+// The ENV unit's telemetry was parsed straight to Serial and
+// dropped -- nothing kept it, so there was nothing to put in a
+// status frame. NAN means "never received" and serialises as
+// JSON null, which the protocol requires: an absent sensor must
+// not reach the phone as a plausible zero.
+float envTemp     = NAN;   // deg C
+float envHumidity = NAN;   // % RH
+float envPressure = NAN;   // hPa
+float envAltitude = NAN;   // m
+float envLat      = NAN;   // WGS-84
+float envLon      = NAN;
+int   envSats     = 0;
+bool  envGpsFix   = false;
+unsigned long lastEnvDataTime = 0;
+
+// Retains one "KEY=VALUE" token while the existing chain below
+// prints it. One call at the top of the loop rather than an edit
+// to each of ten branches.
+void captureEnvToken(const char *tok) {
+  if      (!strncmp(tok, "TEMP=",  5)) envTemp     = atof(tok + 5);
+  else if (!strncmp(tok, "HUM=",   4)) envHumidity = atof(tok + 4);
+  else if (!strncmp(tok, "PRESS=", 6)) envPressure = atof(tok + 6);
+  else if (!strncmp(tok, "ALT=",   4)) envAltitude = atof(tok + 4);
+  else if (!strncmp(tok, "LAT=",   4)) envLat      = atof(tok + 4);
+  else if (!strncmp(tok, "LON=",   4)) envLon      = atof(tok + 4);
+  else if (!strncmp(tok, "SAT=",   4)) envSats     = atoi(tok + 4);
+  else if (!strncmp(tok, "GPS=",   4)) envGpsFix   = atoi(tok + 4) != 0;
+  else return;
+
+  lastEnvDataTime = millis();
+}
+
+// Rate-limited so a persistent version mismatch cannot flood the log.
+unsigned long lastWristbandRejectLog = 0;
 
 // =====================================================
 // LOGO GRAPHIC - 128 x 48 PIXELS (unchanged)
@@ -657,10 +731,34 @@ void ecgDrawLeadOff() {
   display.display();
 }
 
+// Raw samples for the phone, filled at the full 250 Hz and
+// flushed as one `ecg` frame every 62 samples (4 Hz). Tapped
+// before every early return below: the phone needs the samples
+// the OLED does not draw, so display decimation must not also
+// decimate the recording.
+constexpr int ECG_TX_BATCH = ECG_SAMPLE_RATE / 4;   // 62
+uint16_t ecgTxBuffer[ECG_TX_BATCH];
+int ecgTxCount = 0;
+bool ecgTxReady = false;
+bool ecgTxLeadOff = false;
+unsigned long ecgTxFirstSampleMs = 0;
+uint32_t ecgTxSeq = 0;
+
 void ecgProcessSample() {
   int raw = analogRead(ECG_PIN);
 
   bool leadOff = digitalRead(ECG_LO_PLUS) || digitalRead(ECG_LO_MINUS);
+
+  // ---- phone tap ----
+  if (!ecgTxReady) {
+    if (ecgTxCount == 0) {
+      ecgTxFirstSampleMs = millis();
+      ecgTxLeadOff = false;
+    }
+    ecgTxBuffer[ecgTxCount++] = (uint16_t)raw;
+    if (leadOff) ecgTxLeadOff = true;
+    if (ecgTxCount >= ECG_TX_BATCH) ecgTxReady = true;
+  }
 
   if (!ecgCalibrated) {
     ecgCalibrate(raw, leadOff);
@@ -1230,23 +1328,77 @@ void onDataRecv(
   // null-terminated command string -- detect it by exact
   // size before falling through to the text-based parser
   // below (which is unchanged from masterwithoutnavbutton.ino).
+  // Identified by MAGIC and VERSION, not by length. Length alone
+  // meant any ESP-NOW sender that happened to emit a payload of
+  // this size was accepted as patient vitals, and a struct change
+  // on one board only fell through to the text parser below and
+  // read raw binary as an ASCII command.
   if (len == sizeof(WristbandPacket)) {
-    memcpy(&latestWristband, data, sizeof(WristbandPacket));
+    WristbandPacket incoming;
+    memcpy(&incoming, data, sizeof(WristbandPacket));
+
+    if (incoming.magic != WRIST_PACKET_MAGIC ||
+        incoming.version != WRIST_PACKET_VERSION) {
+
+      unsigned long nowMs = millis();
+      if (nowMs - lastWristbandRejectLog > 2000) {
+        lastWristbandRejectLog = nowMs;
+
+        Serial.print("[WRIST] REJECTED packet: magic=0x");
+        Serial.print(incoming.magic, HEX);
+        Serial.print(" version=");
+        Serial.print(incoming.version);
+        Serial.print(" (expected magic=0x");
+        Serial.print(WRIST_PACKET_MAGIC, HEX);
+        Serial.print(" version=");
+        Serial.print(WRIST_PACKET_VERSION);
+        Serial.println("). Reflash both boards.");
+      }
+      return;
+    }
+
+    latestWristband = incoming;
     lastWristbandRxTime = millis();
     wristbandLinkEverSeen = true;
+    wristbandRxCount++;
 
-    Serial.print("[WRIST] RX HR=");
-    Serial.print(latestWristband.heartRate);
-    Serial.print(" SpO2=");
-    Serial.print(latestWristband.spo2);
-    Serial.print(" Temp=");
-    Serial.print(latestWristband.temperatureF);
-    Serial.print("F Finger=");
-    Serial.print(latestWristband.fingerDetected);
-    Serial.print(" Fall=");
-    Serial.print(latestWristband.fallDetected);
-    Serial.print(" Panic=");
-    Serial.println(latestWristband.panicPressed);
+    unsigned long nowMs = millis();
+    if (nowMs - lastWristbandLogTime >= WRISTBAND_LOG_INTERVAL) {
+      lastWristbandLogTime = nowMs;
+
+      Serial.print("[WRIST] RX seq=");
+      Serial.print(latestWristband.seq);
+      Serial.print(" n=");
+      Serial.print(wristbandRxCount);
+      Serial.print(" HR=");
+      Serial.print(latestWristband.heartRate);
+      Serial.print(" SpO2=");
+      Serial.print(latestWristband.spo2);
+      Serial.print(" Temp=");
+      Serial.print(latestWristband.temperatureF);
+      Serial.print("F Finger=");
+      Serial.print(latestWristband.fingerDetected);
+      Serial.print(" Fall=");
+      Serial.print(latestWristband.fallDetected);
+      Serial.print(" Panic=");
+      Serial.print(latestWristband.panicPressed);
+
+      Serial.print(" | accel=");
+      Serial.print(latestWristband.accel / 10.0, 2);
+      Serial.print(" [x ");
+      Serial.print(latestWristband.ax / 100.0, 2);
+      Serial.print(" y ");
+      Serial.print(latestWristband.ay / 100.0, 2);
+      Serial.print(" z ");
+      Serial.print(latestWristband.az / 100.0, 2);
+      Serial.print("] peak=");
+      Serial.print(latestWristband.accelPeak / 10.0, 2);
+
+      Serial.print(" | health:");
+      Serial.print((latestWristband.sensorHealth & HEALTH_PULSEOX) ? " pulseox" : " NO-PULSEOX");
+      Serial.print((latestWristband.sensorHealth & HEALTH_ACCEL)   ? " accel"   : " NO-ACCEL");
+      Serial.println((latestWristband.sensorHealth & HEALTH_TEMP)  ? " temp"    : " NO-TEMP");
+    }
 
     return;
   }
@@ -1294,6 +1446,8 @@ void onDataRecv(
     char *token = strtok(message, ";");
 
     while (token != nullptr) {
+
+      captureEnvToken(token);
 
       if (strncmp(token, "TYPE=", 5) == 0) {
 
@@ -1391,6 +1545,8 @@ void onDataRecv(
     char *token = strtok(message, ";");
 
     while (token != nullptr) {
+
+      captureEnvToken(token);
 
       if (strncmp(token, "TYPE=", 5) == 0) {
 
@@ -1618,6 +1774,318 @@ void processCommand(char *cmd) {
 // SETUP
 // =====================================================
 
+// =====================================================
+// PHONE BRIDGE - SoftAP + WebSocket + JSON
+// =====================================================
+// Implements docs/protocol.md v2 from the app repository:
+// the box is the server, the phone joins its SoftAP and
+// opens ws://192.168.4.1:81/ws.
+//
+// JSON is built with snprintf rather than ArduinoJson. Every
+// frame here has a fixed shape and only ever contains numbers,
+// booleans and null, so there is nothing to escape -- and the
+// ecg frame carries 62 samples four times a second, which is
+// exactly the sort of repeated allocation worth not doing on
+// a board that is also driving an OLED and an ADC.
+
+constexpr uint16_t WS_PORT       = 81;
+constexpr uint8_t  SOFTAP_CHANNEL = 1;
+
+// ESP-NOW peers use channel 0 ("whatever channel we are on"),
+// so the SoftAP channel becomes the channel for everything.
+// If the band or ENV unit ever pins a channel explicitly, it
+// has to be this one.
+WebSocketsServer webSocket = WebSocketsServer(WS_PORT);
+
+bool phoneConnected = false;
+unsigned long lastStatusTxTime = 0;
+constexpr unsigned long STATUS_TX_INTERVAL = 1000;   // 1 Hz
+
+// ---- wall clock -------------------------------------
+// The box has no RTC, so millis() is all it has. Rather than
+// shipping millis() and making the app guess, we learn the
+// epoch from the phone: every `ping` carries the phone's own
+// `ts`, so the first one gives us an offset good to the link
+// latency. Until then `ts` is millis() and the app is told
+// nothing is calibrated.
+int64_t epochOffsetMs = 0;
+bool epochKnown = false;
+
+static int64_t boxNowMs() {
+  return epochKnown ? ((int64_t)millis() + epochOffsetMs) : (int64_t)millis();
+}
+
+// ---- box-owned fall / panic latch (protocol section 4) ----
+// The band clears its own flags after 5 s. The protocol makes
+// the *box* the owner of a 30 s latch, so that the alert
+// survives the phone being asleep, absent or reconnecting.
+constexpr unsigned long BOX_LATCH_MS = 30000;
+
+bool boxFall = false, boxPanic = false;
+unsigned long boxFallUntil = 0, boxPanicUntil = 0;
+bool prevBandFall = false, prevBandPanic = false;
+
+static void latchUpdate() {
+  unsigned long now = millis();
+
+  bool bandFall  = latestWristband.fallDetected  != 0;
+  bool bandPanic = latestWristband.panicPressed != 0;
+
+  // Rising edge only. A flag held true across many packets is
+  // one event, not one per packet.
+  if (bandFall && !prevBandFall)   { boxFall  = true; boxFallUntil  = now + BOX_LATCH_MS; }
+  if (bandPanic && !prevBandPanic) { boxPanic = true; boxPanicUntil = now + BOX_LATCH_MS; }
+
+  prevBandFall  = bandFall;
+  prevBandPanic = bandPanic;
+
+  if (boxFall  && (long)(now - boxFallUntil)  >= 0) boxFall  = false;
+  if (boxPanic && (long)(now - boxPanicUntil) >= 0) boxPanic = false;
+}
+
+// ---- nullable formatting ----------------------------
+// An absent reading is JSON null, never 0 and never -999.
+// The app renders "--" for null; a sentinel would be drawn as
+// a real measurement.
+static void fmtF(char *out, size_t cap, float v, int dp, bool valid) {
+  if (!valid || isnan(v)) snprintf(out, cap, "null");
+  else                    snprintf(out, cap, "%.*f", dp, v);
+}
+
+static void fmtI(char *out, size_t cap, int v, bool valid) {
+  if (!valid) snprintf(out, cap, "null");
+  else        snprintf(out, cap, "%d", v);
+}
+
+// ---- status frame -----------------------------------
+static void sendStatusFrame() {
+  // Band liveness. Anything sourced from the band is null when
+  // the band is not currently heard from -- repeating the last
+  // value would let the app draw a five-minute-old heart rate
+  // as a live reading on a patient the band has fallen off.
+  bool bandLive = wristbandLinkEverSeen &&
+                  (millis() - lastWristbandRxTime < 3000);
+
+  bool fingerOn = bandLive && latestWristband.fingerDetected;
+  bool tempOk   = bandLive && latestWristband.temperatureF > -100.0;
+  bool accelOk  = bandLive && (latestWristband.sensorHealth & HEALTH_ACCEL);
+
+  char hr[12], spo2[12], btemp[16];
+  fmtI(hr,   sizeof(hr),   latestWristband.heartRate, fingerOn);
+  fmtI(spo2, sizeof(spo2), latestWristband.spo2,      fingerOn);
+  fmtF(btemp, sizeof(btemp), latestWristband.temperatureF, 1, tempOk);
+
+  // Band reports m/s^2 x100; the protocol carries g.
+  char ax[12], ay[12], az[12], mag[12];
+  fmtF(ax,  sizeof(ax),  (latestWristband.ax / 100.0f) / 9.80665f, 3, accelOk);
+  fmtF(ay,  sizeof(ay),  (latestWristband.ay / 100.0f) / 9.80665f, 3, accelOk);
+  fmtF(az,  sizeof(az),  (latestWristband.az / 100.0f) / 9.80665f, 3, accelOk);
+
+  float magG = (latestWristband.accel / 10.0f) / 9.80665f;
+  fmtF(mag, sizeof(mag), magG, 3, accelOk);
+
+  // Provisional activity classification, done here because the
+  // band does not classify yet. Thresholds are deliberately
+  // crude and want tuning against real wear data -- "unknown"
+  // when there is no accelerometer, rather than a guess.
+  const char *activity = "unknown";
+  if (accelOk) {
+    float peakG = (latestWristband.accelPeak / 10.0f) / 9.80665f;
+    float dev = fabs(peakG - 1.0f);
+    if      (dev < 0.15f) activity = "resting";
+    else if (dev < 0.60f) activity = "walking";
+    else                  activity = "active";
+  }
+
+  char eTemp[12], eHum[12], ePres[12], eAlt[12], eLat[16], eLon[16];
+  fmtF(eTemp, sizeof(eTemp), envTemp,     1, true);
+  fmtF(eHum,  sizeof(eHum),  envHumidity, 1, true);
+  fmtF(ePres, sizeof(ePres), envPressure, 1, true);
+  fmtF(eAlt,  sizeof(eAlt),  envAltitude, 1, true);
+  fmtF(eLat,  sizeof(eLat),  envLat, 5, envGpsFix);
+  fmtF(eLon,  sizeof(eLon),  envLon, 5, envGpsFix);
+
+  char buf[720];
+  snprintf(buf, sizeof(buf),
+    "{\"t\":\"status\",\"ts\":%lld,"
+    "\"vitals\":{\"hr\":%s,\"spo2\":%s,\"body_temp_f\":%s},"
+    "\"band\":{\"connected\":%s,\"battery\":null,\"fall\":%s,\"panic\":%s},"
+    "\"motion\":{\"ax\":%s,\"ay\":%s,\"az\":%s,\"mag\":%s,"
+    "\"activity\":\"%s\",\"steps\":null},"
+    "\"env\":{\"temp\":%s,\"humidity\":%s,\"pressure\":%s,"
+    "\"altitude\":%s,\"lat\":%s,\"lon\":%s},"
+    "\"o2\":{\"valve_open\":%s,\"flow_lpm\":null,"
+    "\"mode\":\"manual\",\"trigger\":%s}}",
+    (long long)boxNowMs(),
+    hr, spo2, btemp,
+    bandLive ? "true" : "false",
+    boxFall ? "true" : "false",
+    boxPanic ? "true" : "false",
+    ax, ay, az, mag, activity,
+    eTemp, eHum, ePres, eAlt, eLat, eLon,
+    oxygenSupplyActive ? "true" : "false",
+    // Reported as "manual" because that is what it is: the valve is
+    // opened from the OLED menu and its rate set by a potentiometer.
+    // There is no SpO2-driven control path yet. Saying "auto" here
+    // would tell the phone a clinical decision had been made by the
+    // box when a person pressed a button.
+    oxygenSupplyActive ? "\"manual\"" : "null");
+
+  webSocket.broadcastTXT(buf);
+}
+
+// ---- ecg frame --------------------------------------
+static void sendEcgFrame() {
+  // 62 samples of at most 4 digits plus a comma, plus the
+  // envelope. Sized with headroom and still bounds-checked
+  // below, because overrunning this on an ADC value would be
+  // a silent memory bug on a medical device.
+  char buf[512];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"t\":\"ecg\",\"ts\":%lld,\"fs\":%d,\"seq\":%lu,"
+    "\"leads_off\":%s,\"s\":[",
+    (long long)(boxNowMs() - (millis() - ecgTxFirstSampleMs)),
+    ECG_SAMPLE_RATE,
+    (unsigned long)ecgTxSeq++,
+    ecgTxLeadOff ? "true" : "false");
+
+  for (int i = 0; i < ecgTxCount && n < (int)sizeof(buf) - 8; i++) {
+    n += snprintf(buf + n, sizeof(buf) - n, "%s%u",
+                  i ? "," : "", ecgTxBuffer[i]);
+  }
+
+  snprintf(buf + n, sizeof(buf) - n, "]}");
+  webSocket.broadcastTXT(buf);
+
+  ecgTxCount = 0;
+  ecgTxReady = false;
+}
+
+// ---- inbound ----------------------------------------
+// Only two message types arrive, both fixed shape, so this
+// reads them with strstr rather than pulling in a parser.
+static void handlePhoneMessage(const char *msg) {
+  if (strstr(msg, "\"ping\"")) {
+    // Learn wall-clock time from the phone. The box has no RTC,
+    // and the protocol's `ts` is defined as epoch milliseconds;
+    // the ping carries exactly that.
+    const char *tsField = strstr(msg, "\"ts\"");
+    if (tsField) {
+      const char *colon = strchr(tsField, ':');
+      if (colon) {
+        int64_t phoneTs = atoll(colon + 1);
+        // Sanity: anything past 2020 is a real epoch, anything
+        // smaller is a box that is itself uncalibrated.
+        if (phoneTs > 1600000000000LL) {
+          epochOffsetMs = phoneTs - (int64_t)millis();
+          if (!epochKnown) {
+            epochKnown = true;
+            Serial.println("[WS] Wall clock learned from phone ping");
+          }
+        }
+      }
+    }
+
+    char pong[64];
+    snprintf(pong, sizeof(pong), "{\"t\":\"pong\",\"ts\":%lld}",
+             (long long)boxNowMs());
+    webSocket.broadcastTXT(pong);
+    return;
+  }
+
+  if (strstr(msg, "\"ack\"")) {
+    if (strstr(msg, "\"fall\"")) {
+      boxFall = false;
+      Serial.println("[WS] ACK fall -- latch cleared");
+    }
+    if (strstr(msg, "\"panic\"")) {
+      boxPanic = false;
+      Serial.println("[WS] ACK panic -- latch cleared");
+    }
+    return;
+  }
+}
+
+static void onWsEvent(uint8_t num, WStype_t type, uint8_t *payload, size_t len) {
+  switch (type) {
+    case WStype_CONNECTED: {
+      IPAddress ip = webSocket.remoteIP(num);
+      phoneConnected = true;
+      Serial.printf("[WS] Phone connected from %s\n", ip.toString().c_str());
+      break;
+    }
+    case WStype_DISCONNECTED:
+      phoneConnected = (webSocket.connectedClients() > 0);
+      Serial.printf("[WS] Phone %u disconnected\n", num);
+      break;
+
+    case WStype_TEXT:
+      // Payload is not guaranteed null-terminated by the library.
+      if (len < 250) {
+        char msg[251];
+        memcpy(msg, payload, len);
+        msg[len] = '\0';
+        handlePhoneMessage(msg);
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ---- lifecycle --------------------------------------
+void bridgeBegin() {
+  // AP_STA, not AP: ESP-NOW to the band and the ENV unit runs
+  // on the station interface and must keep working while the
+  // phone is attached to the access point.
+  WiFi.mode(WIFI_AP_STA);
+
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+
+  char ssid[32];
+  snprintf(ssid, sizeof(ssid), "HealthBox-%02X%02X", mac[4], mac[5]);
+
+  // Open network. The link carries patient data and should be
+  // secured before this leaves a demo bench -- see the note in
+  // the app repo's protocol document.
+  WiFi.softAP(ssid, nullptr, SOFTAP_CHANNEL);
+
+  Serial.println();
+  Serial.println("==============================================");
+  Serial.printf("  SoftAP  : %s\n", ssid);
+  Serial.printf("  Box IP  : %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.printf("  Endpoint: ws://%s:%u/ws\n",
+                WiFi.softAPIP().toString().c_str(), WS_PORT);
+  Serial.println("==============================================");
+
+  webSocket.begin();
+  webSocket.onEvent(onWsEvent);
+}
+
+void bridgeUpdate() {
+  webSocket.loop();
+  latchUpdate();
+
+  if (webSocket.connectedClients() == 0) {
+    // Nothing is listening. Keep draining the ECG buffer so it
+    // does not go stale and then flush 62 old samples the
+    // instant a phone attaches.
+    if (ecgTxReady) { ecgTxCount = 0; ecgTxReady = false; }
+    return;
+  }
+
+  if (ecgTxReady) sendEcgFrame();
+
+  unsigned long now = millis();
+  if (now - lastStatusTxTime >= STATUS_TX_INTERVAL) {
+    lastStatusTxTime = now;
+    sendStatusFrame();
+  }
+}
+
+
 void setup() {
 
   Serial.begin(115200);
@@ -1681,7 +2149,11 @@ void setup() {
   Serial.println("        ESP32 DOIT DEVKIT V1");
   Serial.println("==============================================");
 
-  WiFi.mode(WIFI_STA);
+  // bridgeBegin() puts the radio in AP_STA and raises the SoftAP.
+  // It runs before esp_now_init() so the channel is settled before
+  // any peer is added -- the ESP-NOW peers here use channel 0,
+  // meaning "whatever channel the interface is already on".
+  bridgeBegin();
 
   delay(100);
 
@@ -1748,6 +2220,11 @@ void setup() {
 // =====================================================
 
 void loop() {
+
+  // Phone bridge first: the WebSocket library needs servicing every
+  // pass, and the ECG batch is flushed the moment it is full rather
+  // than waiting behind the display code.
+  bridgeUpdate();
 
   if (Serial.available()) {
 

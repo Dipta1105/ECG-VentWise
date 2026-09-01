@@ -5,6 +5,17 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
+// Hoisted above every function so the auto-generated prototypes
+// that reference it are valid. See the note further down.
+struct EnvField {
+  const char *prefix;   // e.g. "TEMP="
+  uint8_t prefixLen;
+  const char *label;    // print label
+  const char *suffix;   // unit / suffix appended after value, "" if none
+  bool isBoolFlag;      // true => print OK/FAIL (DHT/BMP/LIS) or FIX/NO FIX (GPS) via atoi
+  bool isFixFlag;       // true => use FIX/NO FIX wording instead of OK/FAIL
+};
+
 // =====================================================
 // VENTWISE V3 - MASTER / OBC
 // BOARD: ESP32 DOIT DEVKIT V1
@@ -206,17 +217,45 @@ void startIndicatorStartup() {
 // =====================================================
 // WRISTBAND ESP-NOW PACKET (declared early so LED logic can use it)
 // =====================================================
+// Must match wristband.ino byte for byte. Bump WRIST_PACKET_VERSION
+// on both sides together whenever this changes.
+#define WRIST_PACKET_MAGIC   0x5742   // 'WB'
+#define WRIST_PACKET_VERSION 2
+
+#define HEALTH_PULSEOX 0x01
+#define HEALTH_ACCEL   0x02
+#define HEALTH_TEMP    0x04
+
 typedef struct __attribute__((packed)) {
+  uint16_t magic;
+  uint8_t  version;
+  uint8_t  sensorHealth;
+  uint16_t seq;
+
   int16_t heartRate;
   int16_t spo2;
   uint8_t fingerDetected;
   uint8_t fallDetected;
-  int16_t accel;
   uint8_t panicPressed;
+
+  int16_t accel;       // magnitude, m/s^2 x10
+  int16_t ax;          // per-axis, m/s^2 x100
+  int16_t ay;
+  int16_t az;
+  int16_t accelPeak;   // max magnitude since previous packet, m/s^2 x10
+
   float temperatureF;
 } WristbandPacket;
 
-WristbandPacket latestWristband = {0, 0, 0, 0, 0, 0, -127.0};
+WristbandPacket latestWristband = {
+  WRIST_PACKET_MAGIC, WRIST_PACKET_VERSION, 0, 0,
+  0, 0, 0, 0, 0,
+  0, 0, 0, 0, 0,
+  -127.0
+};
+unsigned long wristbandRxCount = 0;
+unsigned long lastWristbandLogTime = 0;
+unsigned long lastWristbandRejectLog = 0;
 bool wristbandLinkEverSeen = false;
 bool oxygenSupplyActive = false; // forward declared for use in LED logic below
 
@@ -1250,14 +1289,12 @@ void updateActiveScreenLogic() {
 // TYPE=DATA and TYPE=STATUS used to have two near-identical
 // blocks of strncmp/print chains. Both are now driven by one
 // table + one parser, selectable per message type.
-struct EnvField {
-  const char *prefix;   // e.g. "TEMP="
-  uint8_t prefixLen;
-  const char *label;    // print label
-  const char *suffix;   // unit / suffix appended after value, "" if none
-  bool isBoolFlag;      // true => print OK/FAIL (DHT/BMP/LIS) or FIX/NO FIX (GPS) via atoi
-  bool isFixFlag;       // true => use FIX/NO FIX wording instead of OK/FAIL
-};
+// Defined via #include-level placement at the top of the file
+// instead -- see the EnvField block near the includes. This file
+// did not build before that move: arduino-cli generates forward
+// declarations for printEnvField() and parseEnvTokens() and
+// inserts them above this point, so EnvField was referenced
+// before it existed.
 
 // Fields valid in TYPE=DATA telemetry packets
 const EnvField envDataFields[] = {
@@ -1334,16 +1371,44 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   }
 
   // WRISTBAND BINARY PACKET
+  // Identified by MAGIC and VERSION, not by length alone.
   if (len == sizeof(WristbandPacket)) {
-    memcpy(&latestWristband, data, sizeof(WristbandPacket));
-    lastWristbandRxTime = millis();
+    WristbandPacket incoming;
+    memcpy(&incoming, data, sizeof(WristbandPacket));
+
+    unsigned long nowMs = millis();
+
+    if (incoming.magic != WRIST_PACKET_MAGIC ||
+        incoming.version != WRIST_PACKET_VERSION) {
+      if (nowMs - lastWristbandRejectLog > 2000) {
+        lastWristbandRejectLog = nowMs;
+        Serial.printf("[WRIST] REJECTED: magic=0x%04X version=%u "
+                      "(expected 0x%04X / %u). Reflash both boards.\n",
+                      incoming.magic, incoming.version,
+                      WRIST_PACKET_MAGIC, WRIST_PACKET_VERSION);
+      }
+      return;
+    }
+
+    latestWristband = incoming;
+    lastWristbandRxTime = nowMs;
     wristbandLinkEverSeen = true;
     wristbandConnected = true;
+    wristbandRxCount++;
 
-    Serial.printf("[WRIST] HR=%d SpO2=%d Temp=%.1fF Finger=%d Fall=%d Panic=%d\n",
-                  latestWristband.heartRate, latestWristband.spo2,
-                  latestWristband.temperatureF, latestWristband.fingerDetected,
-                  latestWristband.fallDetected, latestWristband.panicPressed);
+    if (nowMs - lastWristbandLogTime >= 1000) {
+      lastWristbandLogTime = nowMs;
+      Serial.printf("[WRIST] seq=%u n=%lu HR=%d SpO2=%d Temp=%.1fF "
+                    "Finger=%d Fall=%d Panic=%d accel=%.2f "
+                    "[x %.2f y %.2f z %.2f] peak=%.2f\n",
+                    latestWristband.seq, wristbandRxCount,
+                    latestWristband.heartRate, latestWristband.spo2,
+                    latestWristband.temperatureF, latestWristband.fingerDetected,
+                    latestWristband.fallDetected, latestWristband.panicPressed,
+                    latestWristband.accel / 10.0,
+                    latestWristband.ax / 100.0, latestWristband.ay / 100.0,
+                    latestWristband.az / 100.0, latestWristband.accelPeak / 10.0);
+    }
     return;
   }
 
